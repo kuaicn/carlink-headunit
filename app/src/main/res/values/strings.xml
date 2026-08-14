@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">车机互联</string>
+
+    <!-- MainActivity -->
+    <string name="label_ip">手机 IP 地址</string>
+    <string name="label_port">控制端口</string>
+    <string name="hint_ip">例如 192.168.43.1</string>
+    <string name="hint_port">27183</string>
+    <string name="btn_connect">连接</string>
+    <string name="status_idle">车机连上手机热点后，输入手机 IP 并点击连接</string>
+    <string name="status_connecting">正在连接手机…</string>
+    <string name="status_disconnected">已断开</string>
+    <string name="status_disconnected_with_reason">已断开：%1$s</string>
+    <string name="error_invalid_ip">请输入有效的手机 IP 地址</string>
+    <string name="error_invalid_port">端口无效（1–65535）</string>
+
+    <!-- ProjectionActivity -->
+    <string name="projection_connecting">正在连接手机…</string>
+    <string name="projection_starting_video">正在建立视频通道…</string>
+    <string name="error_no_decoder">本机没有可用的 H.264/H.265 视频解码器</string>
+    <string name="reason_phone_closed">手机端已关闭连接</string>
+    <string name="reason_control_failed">控制通道发送失败</string>
+    <string name="reason_unknown">未知原因</string>
+    <string name="toast_disconnected">投屏已断开：%1$s</string>
+    <string name="exit_hint">双击左上角退出投屏</string>
+</resources>
