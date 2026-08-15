@@ -1,8 +1,16 @@
 package com.carlink.headunit;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.ConnectivityManager;
+import android.net.DhcpInfo;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.RouteInfo;
+import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.inputmethod.EditorInfo;
@@ -12,9 +20,16 @@ import android.widget.TextView;
 
 import com.carlink.headunit.net.Protocol;
 
+import java.net.Inet4Address;
+import java.net.InetAddress;
+
 /**
  * Connection screen: phone IP / control port inputs, connect button, status line.
  * The last entered values are persisted in SharedPreferences.
+ * <p>
+ * On a phone hotspot the phone IS the WiFi gateway, so on first launch the gateway
+ * address is prefilled and the connection is started automatically (once per process);
+ * only when that fails (or no gateway was found) does the user type the IP by hand.
  */
 public class MainActivity extends Activity {
 
@@ -31,6 +46,12 @@ public class MainActivity extends Activity {
 
     /** Phone hotspot default gateway address. */
     private static final String DEFAULT_IP = "192.168.43.1";
+
+    /** Process-wide one-shot: auto-connect fires only from the first onCreate of the
+     * process. Returning from a failed projection (onActivityResult) or a configuration
+     * change must never re-trigger it — that would loop and take the manual-input stage
+     * away from the user. */
+    private static boolean autoConnectAttempted;
 
     private SharedPreferences prefs;
     private EditText editIp;
@@ -61,6 +82,83 @@ public class MainActivity extends Activity {
             }
             return false;
         });
+
+        tryAutoConnect();
+    }
+
+    /**
+     * One-shot auto-connect: on a phone hotspot the phone is the WiFi gateway, so prefill
+     * the gateway address and connect right away. Does nothing when no gateway can be
+     * determined (no WiFi / no default route) — the manual flow stays as is.
+     */
+    private void tryAutoConnect() {
+        if (autoConnectAttempted) {
+            return;
+        }
+        autoConnectAttempted = true;
+        String gateway = findGatewayIp();
+        if (gateway == null) {
+            Log.i(TAG, "no WiFi gateway found, staying on manual input");
+            return;
+        }
+        Log.i(TAG, "WiFi gateway is " + gateway + ", auto-connecting");
+        editIp.setText(gateway);
+        startProjection();
+        if (!btnConnect.isEnabled()) {
+            // startProjection() launched (it only refuses on invalid input, excluded by
+            // the gateway validation); replace its generic status with the auto-connect one
+            textStatus.setText(getString(R.string.status_auto_connecting, gateway));
+        }
+    }
+
+    /**
+     * IPv4 default-gateway address of the current WiFi connection, or null if there is
+     * none (no WiFi, no default route, or only an IPv6 gateway).
+     */
+    @SuppressWarnings("deprecation") // WifiManager.getDhcpInfo(): fallback for the gateway
+    private String findGatewayIp() {
+        // Preferred: the default route of the active network, when that network is WiFi
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (cm != null) {
+            Network network = cm.getActiveNetwork();
+            NetworkCapabilities caps = network != null ? cm.getNetworkCapabilities(network) : null;
+            if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                LinkProperties lp = cm.getLinkProperties(network);
+                if (lp != null) {
+                    for (RouteInfo route : lp.getRoutes()) {
+                        if (route.isDefaultRoute()) {
+                            String ip = ipv4Address(route.getGateway());
+                            if (ip != null) {
+                                return ip;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: the gateway from the last successful DHCP request (deprecated since
+        // API 31 but functional from minSdk 24; the int is little-endian, 0 = none)
+        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (wm != null) {
+            DhcpInfo dhcp = wm.getDhcpInfo();
+            if (dhcp != null && dhcp.gateway != 0) {
+                int gw = dhcp.gateway;
+                return (gw & 0xff) + "." + ((gw >> 8) & 0xff) + "."
+                        + ((gw >> 16) & 0xff) + "." + ((gw >>> 24) & 0xff);
+            }
+        }
+        return null;
+    }
+
+    /** Dotted-quad string for an IPv4 address, excluding the unusable 0.0.0.0. */
+    private static String ipv4Address(InetAddress address) {
+        if (address instanceof Inet4Address) {
+            String ip = address.getHostAddress();
+            if (ip != null && !"0.0.0.0".equals(ip) && isValidIpv4(ip)) {
+                return ip;
+            }
+        }
+        return null;
     }
 
     private void startProjection() {
@@ -132,6 +230,10 @@ public class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQUEST_PROJECTION) {
             btnConnect.setEnabled(true);
+            // Park the focus on the button instead of a text field: the most likely next
+            // action after a return is reconnecting (one confirm-key press), and keeping
+            // focus off the EditTexts keeps the soft keyboard closed (stateHidden)
+            btnConnect.requestFocus();
             String reason = data != null ? data.getStringExtra(RESULT_EXTRA_DISCONNECT_REASON) : null;
             if (reason != null && !reason.isEmpty()) {
                 Log.i(TAG, "projection ended, reason: " + reason);

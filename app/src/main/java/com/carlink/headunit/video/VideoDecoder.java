@@ -25,9 +25,17 @@ public final class VideoDecoder {
     public interface Listener {
         /**
          * Called on the decoder thread when the decoded video size becomes known
-         * (MediaCodec.INFO_OUTPUT_FORMAT_CHANGED). The touch coordinate mapping depends on it.
+         * (MediaCodec.INFO_OUTPUT_FORMAT_CHANGED). The touch coordinate mapping and the
+         * surface sizing both depend on it.
          */
         void onVideoSizeChanged(int width, int height);
+
+        /**
+         * Called once on the decoder thread when the first frame has actually been handed
+         * to the surface. Until this fires the screen is pitch black, so the caller keeps
+         * a status hint visible instead of hiding it at decoder start.
+         */
+        void onFirstFrameRendered();
     }
 
     private static final long INPUT_TIMEOUT_US = 10_000; // 10 ms
@@ -129,6 +137,7 @@ public final class VideoDecoder {
                     // One-time milestone (the decoder thread is the only caller): the picture is on screen
                     firstFrameRendered = true;
                     Log.i(TAG, "first video frame rendered");
+                    listener.onFirstFrameRendered();
                 }
             }
         } catch (IllegalStateException e) {

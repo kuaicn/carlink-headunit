@@ -3,6 +3,7 @@ package com.carlink.headunit.touch;
 import android.view.MotionEvent;
 
 import com.carlink.headunit.net.Protocol;
+import com.carlink.headunit.video.FitCenter;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -12,8 +13,10 @@ import java.util.List;
  * control messages. Called on the UI thread only; {@link #setVideoSize} may be called from
  * the decoder thread (packed into one volatile long for atomic cross-thread visibility).
  * <p>
- * Coordinate mapping: the video is rendered fit-center inside the view (letterboxed), so
- * view coordinates are mapped back to video pixels with the same scale/offset. The
+ * Coordinate mapping: the video is rendered fit-center (letterboxed) — ProjectionActivity
+ * sizes the SurfaceView to the video's aspect — so view coordinates are mapped back to
+ * video pixels with the same scale/offset, computed by the shared {@link FitCenter} math
+ * the render path also uses. The
  * screenWidth/screenHeight message fields carry the <b>current video size</b>: the server
  * (PositionMapper.map) silently drops any event whose size does not match the video.
  */
@@ -138,15 +141,13 @@ public final class TouchEventConverter {
     private void add(List<byte[]> messages, int action, long pointerId, float viewX, float viewY, int videoW, int videoH,
             int pressure) {
         // Fit-center (letterbox) mapping: view coordinates -> video pixels
-        float scale = Math.min((float) viewWidth / videoW, (float) viewHeight / videoH);
-        float offsetX = (viewWidth - videoW * scale) / 2f;
-        float offsetY = (viewHeight - videoH * scale) / 2f;
+        FitCenter fit = FitCenter.compute(viewWidth, viewHeight, videoW, videoH);
         /* Clamp rather than drop taps in the letterbox bars: a drag that leaves the video area
          * keeps moving along the nearest edge instead of freezing mid-gesture, the DOWN/MOVE/UP
          * stream stays complete (no extra suppression state), and wire coordinates never go
          * out of range. scale > 0 is guaranteed by the size check in convert(). */
-        int x = clamp(Math.round((viewX - offsetX) / scale), videoW - 1);
-        int y = clamp(Math.round((viewY - offsetY) / scale), videoH - 1);
+        int x = clamp(Math.round((viewX - fit.offsetX) / fit.scale), videoW - 1);
+        int y = clamp(Math.round((viewY - fit.offsetY) / fit.scale), videoH - 1);
         messages.add(Protocol.serializeTouchEvent(action, pointerId, x, y, videoW, videoH, pressure));
     }
 

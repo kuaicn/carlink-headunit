@@ -10,6 +10,7 @@
     <string name="btn_connect">连接</string>
     <string name="status_idle">车机连上手机热点后，输入手机 IP 并点击连接</string>
     <string name="status_connecting">正在连接手机…</string>
+    <string name="status_auto_connecting">正在自动连接（网关 %1$s）…</string>
     <string name="status_disconnected">已断开</string>
     <string name="status_disconnected_with_reason">已断开：%1$s</string>
     <string name="error_invalid_ip">请输入有效的手机 IP 地址</string>
@@ -18,6 +19,9 @@
     <!-- ProjectionActivity -->
     <string name="projection_connecting">正在连接手机…</string>
     <string name="projection_starting_video">正在建立视频通道…</string>
+    <string name="projection_waiting_video">视频通道已连接，正在等待手机画面…</string>
+    <string name="projection_retrying">连接失败，正在重试（第 %1$d/%2$d 次）…</string>
+    <string name="projection_stalled">网络不稳定，正在等待画面恢复…</string>
     <string name="error_no_decoder">本机没有可用的 H.264/H.265 视频解码器</string>
     <string name="reason_phone_closed">手机端已关闭连接</string>
     <string name="reason_control_failed">控制通道发送失败</string>
@@ -25,7 +29,7 @@
     <string name="reason_refused">连接被拒绝，请确认手机端互联服务已开启</string>
     <string name="reason_handshake_failed">与手机端握手失败</string>
     <string name="reason_unreachable">网络不可达，请确认已连上手机热点</string>
-    <string name="reason_busy">手机端正被其他投屏会话占用</string>
+    <string name="reason_busy">手机端正被其他投屏会话占用，请稍后重试</string>
     <string name="reason_invalid_display">手机端无法创建投屏画面</string>
     <string name="reason_no_common_codec">与手机端没有共同支持的视频编码</string>
     <string name="reason_decode_error">视频解码错误</string>
