@@ -25,6 +25,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.carlink.headunit.net.CarLinkSession;
+import com.carlink.headunit.net.DeviceMessageReader;
 import com.carlink.headunit.net.Protocol;
 import com.carlink.headunit.touch.TouchEventConverter;
 import com.carlink.headunit.touch.TouchMessageSender;
@@ -72,6 +73,12 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
     private static final long STALL_HINT_MS = 2500;
     private static final long STALL_CHECK_INTERVAL_MS = 1000;
 
+    /** Phone-death detection: no control byte (heartbeats arrive every ~10s) and no video
+     * frame for this long means the phone side is dead. 3x the 10s heartbeat interval +
+     * margin. Only armed once a heartbeat was ever received: an old phone build never sends
+     * any and must never trip this detection. */
+    private static final long PHONE_DEAD_TIMEOUT_MS = 35000;
+
     /** Exit gesture: two taps within this window inside the top-left corner square. */
     private static final long EXIT_DOUBLE_TAP_MS = 400;
     private static final int EXIT_CORNER_SIZE_DP = 96;
@@ -95,6 +102,7 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
 
     private Thread sessionThread;
     private volatile TouchMessageSender touchSender;
+    private volatile DeviceMessageReader controlReader;
     private volatile VideoDecoder videoDecoder;
 
     private long lastCornerTapTime;
@@ -132,6 +140,31 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
         }
     };
 
+    /**
+     * Periodic phone-death check (UI thread). The phone dying silently (hotspot drop, service
+     * crash without FIN) used to be invisible on a static screen: the video read has nothing
+     * to receive anyway and the urgent-byte probe only detects an already-reset connection.
+     * A heartbeat-capable phone sends a control byte every ~10s, so once any heartbeat was
+     * seen, a long silence on BOTH channels (no control byte AND no video frame) means the
+     * phone is dead — never a static screen, whose heartbeats keep arriving. Never armed for
+     * an old phone (no heartbeat ever seen): it must not be misjudged.
+     */
+    private final Runnable phoneLivenessChecker = new Runnable() {
+        @Override
+        public void run() {
+            DeviceMessageReader reader = controlReader;
+            if (reader != null && reader.isHeartbeatSeen() && !disconnecting.get()) {
+                long now = SystemClock.uptimeMillis();
+                if (now - reader.getLastRxTime() > PHONE_DEAD_TIMEOUT_MS && now - lastFrameTime > PHONE_DEAD_TIMEOUT_MS) {
+                    Log.w(TAG, "phone silent on both channels for " + (now - reader.getLastRxTime()) + " ms, disconnecting");
+                    disconnect(getString(R.string.reason_phone_unresponsive), true);
+                    return; // the activity is finishing: no need to keep checking
+                }
+            }
+            uiHandler.postDelayed(this, STALL_CHECK_INTERVAL_MS);
+        }
+    };
+
     // ------------------------------------------------------------------
     // Lifecycle
     // ------------------------------------------------------------------
@@ -153,6 +186,7 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
 
         enterImmersiveMode();
         uiHandler.postDelayed(stallChecker, STALL_CHECK_INTERVAL_MS);
+        uiHandler.postDelayed(phoneLivenessChecker, STALL_CHECK_INTERVAL_MS);
     }
 
     @Override
@@ -183,6 +217,7 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
     @Override
     protected void onDestroy() {
         uiHandler.removeCallbacks(stallChecker);
+        uiHandler.removeCallbacks(phoneLivenessChecker);
         disconnect(null, false);
         Thread t = sessionThread;
         if (t != null) {
@@ -276,10 +311,14 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
             CarLinkSession.Ready ready = connectWithRetry(metrics, codecs);
             Log.i(TAG, "handshake ok: codec=" + ready.codec + ", videoPort=" + ready.videoPort);
 
-            // 5. Control message sender thread
+            // 5. Control message sender thread + device message reader thread (the control
+            //    channel carries both directions)
             touchSender = new TouchMessageSender(session.getControlOutputStream(),
                     e -> disconnect(getString(R.string.reason_control_failed), true));
             touchSender.start();
+            controlReader = new DeviceMessageReader(session.getControlInputStream(),
+                    e -> disconnect(getString(R.string.reason_control_failed), true));
+            controlReader.start();
 
             // 6. Video stream header, then the decode loop
             PacketReader reader = new PacketReader(session.getVideoInputStream());
@@ -326,7 +365,13 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
                 Log.w(TAG, "session failed: " + reason, e);
             }
         } finally {
-            // Runs on the session thread: stop the sender, release the codec, close both sockets
+            // Runs on the session thread: stop the reader/sender, release the codec, close both sockets.
+            // The reader is stopped first so that its running flag is off before session.close()
+            // makes its pending read fail — a late failure would race the real disconnect reason
+            DeviceMessageReader reader = controlReader;
+            if (reader != null) {
+                reader.stop();
+            }
             TouchMessageSender sender = touchSender;
             if (sender != null) {
                 sender.stop();

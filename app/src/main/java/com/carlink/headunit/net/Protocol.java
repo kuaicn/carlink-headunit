@@ -13,6 +13,7 @@ import java.nio.charset.StandardCharsets;
  * <ul>
  *   <li>carlink-scrcpy/docs/carlink-protocol.md (handshake + video byte layout)</li>
  *   <li>carlink-scrcpy/src/com/genymobile/scrcpy/control/ControlMessageReader.java (control messages)</li>
+ *   <li>carlink-scrcpy/src/com/genymobile/scrcpy/control/DeviceMessageWriter.java (device messages)</li>
  *   <li>carlink-scrcpy/src/com/genymobile/scrcpy/device/Streamer.java (video packet header)</li>
  * </ul>
  * All multi-byte fields are big-endian.
@@ -46,6 +47,17 @@ public final class Protocol {
 
     public static final int TYPE_INJECT_TOUCH_EVENT = 2;
     public static final int TYPE_BACK_OR_SCREEN_ON = 4;
+
+    // ------------------------------------------------------------------
+    // Device messages (phone -> car, on the control channel)
+    // ------------------------------------------------------------------
+
+    /** u32 length + UTF-8 text. */
+    public static final int DEVICE_TYPE_CLIPBOARD = 0;
+    /** s64 sequence. */
+    public static final int DEVICE_TYPE_ACK_CLIPBOARD = 1;
+    /** The type byte alone, no payload; a heartbeat-capable phone sends one every ~10s. */
+    public static final int DEVICE_TYPE_HEARTBEAT = 3;
 
     /* MotionEvent action values. The client must only ever send plain DOWN/MOVE/UP:
      * the server derives ACTION_POINTER_DOWN/UP itself from the pointer count

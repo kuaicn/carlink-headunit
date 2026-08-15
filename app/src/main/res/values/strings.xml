@@ -25,6 +25,7 @@
     <string name="error_no_decoder">本机没有可用的 H.264/H.265 视频解码器</string>
     <string name="reason_phone_closed">手机端已关闭连接</string>
     <string name="reason_control_failed">控制通道发送失败</string>
+    <string name="reason_phone_unresponsive">手机端无响应，已断开</string>
     <string name="reason_timeout">连接超时，请检查网络后重试</string>
     <string name="reason_refused">连接被拒绝，请确认手机端互联服务已开启</string>
     <string name="reason_handshake_failed">与手机端握手失败</string>

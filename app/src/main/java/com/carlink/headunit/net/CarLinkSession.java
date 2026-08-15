@@ -19,8 +19,9 @@ import java.util.List;
  * <ol>
  *   <li>{@link #connect}: TCP to the phone control port, send {@code hello}, receive {@code ready};</li>
  *   <li>{@link #connectVideo}: TCP to the video port from {@code ready};</li>
- *   <li>the control channel then carries scrcpy control messages (car -&gt; phone) and stays
- *       write-only for this client; the video channel carries the video stream (phone -&gt; car).</li>
+ *   <li>the control channel then carries scrcpy control messages (car -&gt; phone) plus device
+ *       messages (phone -&gt; car: clipboard, heartbeat — consumed by {@code DeviceMessageReader});
+ *       the video channel carries the video stream (phone -&gt; car).</li>
  * </ol>
  * All methods are blocking and must be called from a worker thread, except {@link #close()}
  * which is safe to call from any thread (it unblocks pending I/O).
@@ -50,6 +51,7 @@ public final class CarLinkSession {
     private Socket controlSocket;
     private Socket videoSocket;
     private OutputStream controlOut;
+    private InputStream controlIn;
     private InputStream videoIn;
     private boolean closed;
 
@@ -122,6 +124,7 @@ public final class CarLinkSession {
                 throw new IOException("Invalid videoPort in ready message: " + videoPort);
             }
             controlOut = out;
+            controlIn = in;
             return new Ready(codec, videoPort);
         } catch (JSONException e) {
             close();
@@ -161,6 +164,15 @@ public final class CarLinkSession {
     /** Control channel output (valid after {@link #connect}). */
     public OutputStream getControlOutputStream() {
         return controlOut;
+    }
+
+    /**
+     * Control channel input (valid after {@link #connect}): carries the device messages
+     * (phone -&gt; car). Handed to {@code DeviceMessageReader} once the session is up; must
+     * not be read anywhere else (the handshake already consumed its bytes from this stream).
+     */
+    public InputStream getControlInputStream() {
+        return controlIn;
     }
 
     /**
