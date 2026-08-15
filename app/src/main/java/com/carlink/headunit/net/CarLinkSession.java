@@ -9,6 +9,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.List;
 
 /**
@@ -25,6 +26,13 @@ import java.util.List;
  * which is safe to call from any thread (it unblocks pending I/O).
  */
 public final class CarLinkSession {
+
+    /**
+     * No video data for this long triggers a control-channel liveness probe. A static screen
+     * streams nothing for an unbounded time (the phone's encoder blocks until the virtual
+     * display changes), so a stalled video read is normal and must not kill the session.
+     */
+    private static final int VIDEO_STALL_PROBE_MS = 5000;
 
     /** Successful handshake result. */
     public static final class Ready {
@@ -60,8 +68,14 @@ public final class CarLinkSession {
             }
             controlSocket = new Socket();
         }
-        controlSocket.setTcpNoDelay(true);
-        controlSocket.connect(new InetSocketAddress(host, port), timeoutMs);
+        try {
+            controlSocket.setTcpNoDelay(true);
+            controlSocket.connect(new InetSocketAddress(host, port), timeoutMs);
+        } catch (IOException | RuntimeException e) {
+            // A failed connect leaves the socket open: close it (and end the session)
+            close();
+            throw e;
+        }
         try {
             OutputStream out = controlSocket.getOutputStream();
             InputStream in = controlSocket.getInputStream();
@@ -114,6 +128,9 @@ public final class CarLinkSession {
             // JSONException is checked in Android's org.json; building the hello message with
             // fixed keys cannot actually fail, but a malformed response must close the session
             throw new IOException("Handshake failed: malformed JSON", e);
+        } catch (SocketTimeoutException e) {
+            close();
+            throw new IOException("Handshake timed out after " + timeoutMs + " ms", e);
         } catch (IOException | RuntimeException e) {
             close();
             throw e;
@@ -128,9 +145,17 @@ public final class CarLinkSession {
             }
             videoSocket = new Socket();
         }
-        videoSocket.setTcpNoDelay(true);
-        videoSocket.connect(new InetSocketAddress(host, videoPort), timeoutMs);
-        videoIn = videoSocket.getInputStream();
+        try {
+            videoSocket.setTcpNoDelay(true);
+            videoSocket.connect(new InetSocketAddress(host, videoPort), timeoutMs);
+            videoSocket.setSoTimeout(VIDEO_STALL_PROBE_MS);
+            videoIn = new StallProbeInputStream(videoSocket.getInputStream(), controlSocket);
+        } catch (IOException | RuntimeException e) {
+            // A failed video channel ends the whole session: close the control channel too
+            // (the phone does the same on its side), instead of leaving it dangling
+            close();
+            throw e;
+        }
     }
 
     /** Control channel output (valid after {@link #connect}). */
@@ -138,7 +163,11 @@ public final class CarLinkSession {
         return controlOut;
     }
 
-    /** Video stream input (valid after {@link #connectVideo}). */
+    /**
+     * Video stream input (valid after {@link #connectVideo}). Reads time out periodically and
+     * probe the control channel before retrying; this is transparent to the caller, which only
+     * ever sees a blocking read or a real I/O failure.
+     */
     public InputStream getVideoInputStream() {
         return videoIn;
     }
@@ -164,6 +193,48 @@ public final class CarLinkSession {
             } catch (IOException ignored) {
                 // ignore
             }
+        }
+    }
+
+    /**
+     * Video stream wrapper turning read timeouts into control-channel liveness probes.
+     * <p>
+     * A video read that times out means "no frame for a while": normal on a static screen
+     * (the phone's encoder blocks until the virtual display changes), but also the only
+     * symptom of a half-open phone (e.g. its service crashed). Distinguish the two by sending
+     * a TCP urgent byte on the control channel: the phone never enables OOBINLINE, so the
+     * byte is discarded by its TCP stack and never enters the application protocol, while a
+     * dead peer (RST already received) makes the probe fail immediately, which surfaces here
+     * as a read failure and tears the session down instead of freezing the picture forever.
+     */
+    private static final class StallProbeInputStream extends InputStream {
+
+        private final InputStream in;
+        private final Socket probeSocket;
+
+        StallProbeInputStream(InputStream in, Socket probeSocket) {
+            this.in = in;
+            this.probeSocket = probeSocket;
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) throws IOException {
+            for (;;) {
+                try {
+                    return in.read(buffer, offset, length);
+                } catch (SocketTimeoutException e) {
+                    // Throws IOException if the phone is gone; otherwise keep waiting for frames
+                    probeSocket.sendUrgentData(0);
+                }
+            }
+        }
+
+        @Override
+        public int read() throws IOException {
+            // Unused by PacketReader (it reads byte arrays); implemented for completeness
+            byte[] single = new byte[1];
+            int count = read(single, 0, 1);
+            return count < 0 ? -1 : single[0] & 0xff;
         }
     }
 }

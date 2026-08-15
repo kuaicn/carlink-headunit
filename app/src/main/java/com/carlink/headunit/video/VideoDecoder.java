@@ -2,6 +2,7 @@ package com.carlink.headunit.video;
 
 import android.media.MediaCodec;
 import android.media.MediaFormat;
+import android.util.Log;
 import android.view.Surface;
 
 import java.io.IOException;
@@ -18,6 +19,8 @@ import java.nio.ByteBuffer;
  * are safe to call from any thread.
  */
 public final class VideoDecoder {
+
+    private static final String TAG = "CarLinkHeadunit";
 
     public interface Listener {
         /**
@@ -37,6 +40,7 @@ public final class VideoDecoder {
     private boolean released;
     private int videoWidth = -1;
     private int videoHeight = -1;
+    private boolean firstFrameRendered;
 
     /**
      * @param width/height the expected video size; in this protocol it always equals the
@@ -51,6 +55,7 @@ public final class VideoDecoder {
             // No csd-0/csd-1: config packets are fed as regular input with BUFFER_FLAG_CODEC_CONFIG
             c.configure(format, surface, null, 0);
             c.start();
+            Log.i(TAG, "video decoder started: " + c.getName() + " (" + mimeType + ", " + width + "x" + height + ")");
         } catch (IOException | RuntimeException e) {
             // Do not leak the codec if configuration fails
             if (c != null) {
@@ -64,6 +69,9 @@ public final class VideoDecoder {
     /**
      * Feed one packet into the decoder and drain all immediately available output frames.
      * Frames are rendered as soon as they are decoded (low latency).
+     *
+     * @throws IllegalStateException (including {@link MediaCodec.CodecException}) when the
+     *         hardware decoder itself fails; the caller must tear the session down
      */
     public void feed(byte[] data, int length, long pts, boolean isConfig) {
         while (running) {
@@ -71,7 +79,8 @@ public final class VideoDecoder {
             try {
                 inputIndex = codec.dequeueInputBuffer(INPUT_TIMEOUT_US);
             } catch (IllegalStateException e) {
-                return; // codec released concurrently
+                rethrowUnlessStopping(e);
+                return;
             }
             if (inputIndex < 0) {
                 // No free input slot: drain output and retry
@@ -90,7 +99,8 @@ public final class VideoDecoder {
                 int flags = isConfig ? MediaCodec.BUFFER_FLAG_CODEC_CONFIG : 0;
                 codec.queueInputBuffer(inputIndex, 0, length, pts, flags);
             } catch (IllegalStateException e) {
-                return; // codec released concurrently
+                rethrowUnlessStopping(e);
+                return;
             }
             break;
         }
@@ -98,26 +108,45 @@ public final class VideoDecoder {
     }
 
     private void drainOutput() {
-        for (;;) {
-            final int outputIndex;
-            try {
-                outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0);
-            } catch (IllegalStateException e) {
-                return; // codec released concurrently
+        // The whole loop is guarded: getOutputFormat/releaseOutputBuffer fail with
+        // IllegalStateException on a concurrent teardown just like dequeueOutputBuffer does
+        try {
+            for (;;) {
+                int outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0);
+                if (outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                    return;
+                }
+                if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    onFormatChanged(codec.getOutputFormat());
+                    continue;
+                }
+                if (outputIndex < 0) {
+                    continue;
+                }
+                // Render immediately; zero-size buffers carry no image
+                codec.releaseOutputBuffer(outputIndex, bufferInfo.size > 0);
+                if (bufferInfo.size > 0 && !firstFrameRendered) {
+                    // One-time milestone (the decoder thread is the only caller): the picture is on screen
+                    firstFrameRendered = true;
+                    Log.i(TAG, "first video frame rendered");
+                }
             }
-            if (outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                return;
-            }
-            if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                onFormatChanged(codec.getOutputFormat());
-                continue;
-            }
-            if (outputIndex < 0) {
-                continue;
-            }
-            // Render immediately; zero-size buffers carry no image
-            codec.releaseOutputBuffer(outputIndex, bufferInfo.size > 0);
+        } catch (IllegalStateException e) {
+            rethrowUnlessStopping(e);
         }
+    }
+
+    /**
+     * An IllegalStateException from a codec call is benign only while a teardown
+     * ({@link #stop}/{@link #release}) is in progress; otherwise it is a real decoder
+     * error (e.g. CodecException) which must propagate so the session ends cleanly
+     * instead of looping forever on a dead codec.
+     */
+    private void rethrowUnlessStopping(IllegalStateException e) {
+        if (!running || released) {
+            return; // codec stopped/released concurrently
+        }
+        throw e;
     }
 
     private void onFormatChanged(MediaFormat format) {
@@ -132,6 +161,7 @@ public final class VideoDecoder {
         if (width > 0 && height > 0 && (width != videoWidth || height != videoHeight)) {
             videoWidth = width;
             videoHeight = height;
+            Log.i(TAG, "video size changed: " + width + "x" + height);
             listener.onVideoSizeChanged(width, height);
         }
     }

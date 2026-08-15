@@ -2,11 +2,13 @@ package com.carlink.headunit;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
 import android.media.MediaFormat;
 import android.os.Bundle;
 import android.util.DisplayMetrics;
+import android.util.Log;
 import android.view.Display;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -26,8 +28,11 @@ import com.carlink.headunit.video.VideoDecoder;
 
 import java.io.EOFException;
 import java.io.IOException;
+import java.net.ConnectException;
+import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -40,9 +45,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>
  * Touch events are converted on the UI thread and serialized to the control socket by a
  * dedicated sender thread. The BACK key injects BACK into the phone's virtual display
- * instead of leaving; double-tapping the top-left corner exits the projection.
+ * instead of leaving (or cancels the connection attempt if no session exists yet);
+ * double-tapping the top-left corner exits the projection.
  */
 public class ProjectionActivity extends Activity implements SurfaceHolder.Callback {
+
+    private static final String TAG = "CarLinkHeadunit";
 
     private static final int CONNECT_TIMEOUT_MS = 5000;
     private static final long SESSION_JOIN_TIMEOUT_MS = 1500;
@@ -66,6 +74,7 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
     private volatile VideoDecoder videoDecoder;
 
     private long lastCornerTapTime;
+    private boolean firstTouchForwarded;
 
     // ------------------------------------------------------------------
     // Lifecycle
@@ -140,8 +149,10 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-        // If this was not triggered by our own teardown, treat it as a session failure
-        disconnect(getString(R.string.reason_unknown), true);
+        // A surface can only be lost through user or system action (Home/power key, our own
+        // teardown): the session cannot outlive it, but this is not an abnormal disconnect,
+        // so tear down quietly instead of toasting a spurious failure
+        disconnect(null, false);
     }
 
     // ------------------------------------------------------------------
@@ -162,14 +173,18 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
             if (codecs.isEmpty()) {
                 throw new IOException(getString(R.string.error_no_decoder));
             }
+            Log.i(TAG, "session starting: " + phoneIp + ":" + controlPort + ", screen "
+                    + metrics.widthPixels + "x" + metrics.heightPixels + "/" + metrics.densityDpi + ", codecs=" + codecs);
 
             // 3. Control channel + JSON handshake
             CarLinkSession.Ready ready = session.connect(phoneIp, controlPort, metrics.widthPixels, metrics.heightPixels,
                     metrics.densityDpi, codecs, CONNECT_TIMEOUT_MS);
+            Log.i(TAG, "handshake ok: codec=" + ready.codec + ", videoPort=" + ready.videoPort);
 
             // 4. Video channel
             showStatus(getString(R.string.projection_starting_video));
             session.connectVideo(phoneIp, ready.videoPort, CONNECT_TIMEOUT_MS);
+            Log.i(TAG, "video channel connected");
 
             // 5. Control message sender thread
             touchSender = new TouchMessageSender(session.getControlOutputStream(),
@@ -183,6 +198,7 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
             if (mimeType == null) {
                 throw new IOException("Unknown video codec id: " + String.format("0x%08x", codecId));
             }
+            Log.i(TAG, "video stream codec: " + mimeType);
             videoDecoder = new VideoDecoder(mimeType, metrics.widthPixels, metrics.heightPixels, surface,
                     (w, h) -> touchConverter.setVideoSize(w, h));
             showStatus(null); // streaming: hide the status overlay
@@ -191,11 +207,14 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
                 videoDecoder.feed(packet.data, packet.length, packet.pts, packet.isConfig);
             }
         } catch (EOFException e) {
+            // The phone ended the session (user action or phone-side stop): a normal peer
+            // disconnect, not an error
             reason = getString(R.string.reason_phone_closed);
+            Log.i(TAG, "phone closed the session");
         } catch (IOException | RuntimeException e) {
             if (!disconnecting.get()) {
-                String message = e.getMessage();
-                reason = message != null ? message : e.toString();
+                reason = localizeFailure(e);
+                Log.w(TAG, "session failed: " + reason, e);
             }
         } finally {
             // Runs on the session thread: stop the sender, release the codec, close both sockets
@@ -252,6 +271,42 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
         }
     }
 
+    /**
+     * Translate a low-level failure (English exception text, phone rejection token) into a
+     * short Chinese reason. Unknown failures keep the raw text as a parenthesized detail
+     * so they remain diagnosable.
+     */
+    private String localizeFailure(Exception e) {
+        String detail = e.getMessage();
+        if (detail == null || detail.isEmpty()) {
+            detail = e.toString();
+        }
+        String text = (e.getClass().getSimpleName() + ": " + detail).toLowerCase(Locale.US);
+        final int resId;
+        if (e instanceof SocketTimeoutException || text.contains("timed out")) {
+            resId = R.string.reason_timeout;
+        } else if (text.contains("no_common_codec")) {
+            resId = R.string.reason_no_common_codec;
+        } else if (text.contains("invalid_display")) {
+            resId = R.string.reason_invalid_display;
+        } else if (text.contains("busy")) {
+            resId = R.string.reason_busy;
+        } else if (text.contains("handshake")) {
+            resId = R.string.reason_handshake_failed;
+        } else if (e instanceof ConnectException || text.contains("refused")) {
+            resId = R.string.reason_refused;
+        } else if (text.contains("unreachable") || text.contains("no route")) {
+            resId = R.string.reason_unreachable;
+        } else if (text.contains("reset") || text.contains("broken pipe") || text.contains("connection lost")) {
+            resId = R.string.reason_phone_closed;
+        } else if (e instanceof MediaCodec.CodecException || text.contains("codec") || text.contains("packet")) {
+            resId = R.string.reason_decode_error;
+        } else {
+            return getString(R.string.reason_unmapped, detail);
+        }
+        return getString(resId);
+    }
+
     // ------------------------------------------------------------------
     // Input: touch forwarding, back key, exit gesture
     // ------------------------------------------------------------------
@@ -270,6 +325,11 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
         TouchMessageSender sender = touchSender;
         if (sender != null) {
             sender.sendAll(touchConverter.convert(event));
+            // One-time milestone (UI thread only): proves the touch forwarding path is alive
+            if (!firstTouchForwarded) {
+                firstTouchForwarded = true;
+                Log.i(TAG, "first touch event forwarded");
+            }
         }
         return true;
     }
@@ -283,6 +343,10 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
         if (sender != null) {
             sender.send(Protocol.serializeBackOrScreenOn(KeyEvent.ACTION_DOWN));
             sender.send(Protocol.serializeBackOrScreenOn(KeyEvent.ACTION_UP));
+        } else {
+            // No sender yet (still connecting): BACK cancels the connection attempt instead
+            // of being swallowed, so the user is never trapped on the status screen
+            disconnect(null, false);
         }
     }
 

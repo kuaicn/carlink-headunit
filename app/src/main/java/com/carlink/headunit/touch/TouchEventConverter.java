@@ -25,6 +25,12 @@ public final class TouchEventConverter {
     private int viewWidth;
     private int viewHeight;
 
+    /* True while a gesture is in progress whose initial DOWN was dropped (the video size was
+     * unknown at that moment): everything until the final UP/CANCEL must be dropped too, so
+     * the server never receives MOVE/UP for a pointer it never saw go down (a bare UP would
+     * make Controller.injectTouch build an invalid 0-pointer MotionEvent). UI thread only. */
+    private boolean gestureSuppressed;
+
     /** Called from the decoder thread on MediaCodec.INFO_OUTPUT_FORMAT_CHANGED. */
     public void setVideoSize(int width, int height) {
         videoSize = ((long) width << 32) | (height & 0xffffffffL);
@@ -43,16 +49,31 @@ public final class TouchEventConverter {
      */
     public List<byte[]> convert(MotionEvent event) {
         List<byte[]> messages = new ArrayList<>();
+        int action = event.getActionMasked();
+        if (gestureSuppressed) {
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                // The suppressed gesture is over; the next DOWN starts a fresh one
+                gestureSuppressed = false;
+            }
+            return messages;
+        }
+
         long packed = videoSize;
         int videoW = (int) (packed >>> 32);
         int videoH = (int) packed;
         if (videoW <= 0 || videoH <= 0 || viewWidth <= 0 || viewHeight <= 0) {
-            // Video size unknown yet: drop events rather than send coordinates the server
-            // would discard anyway (it validates screenWidth/screenHeight against the video)
+            /* Video size unknown yet: drop events rather than send coordinates the server
+             * would discard anyway (it validates screenWidth/screenHeight against the video).
+             * If this drops a DOWN, suppress the rest of the gesture as well: the matching
+             * UP sent later (once the size is known) would reach a server that never saw the
+             * pointer go down. */
+            if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
+                gestureSuppressed = true;
+            }
             return messages;
         }
 
-        switch (event.getActionMasked()) {
+        switch (action) {
             case MotionEvent.ACTION_DOWN:
             case MotionEvent.ACTION_POINTER_DOWN: {
                 /* Send a plain DOWN for the finger that just touched. The client must NOT send
@@ -120,6 +141,10 @@ public final class TouchEventConverter {
         float scale = Math.min((float) viewWidth / videoW, (float) viewHeight / videoH);
         float offsetX = (viewWidth - videoW * scale) / 2f;
         float offsetY = (viewHeight - videoH * scale) / 2f;
+        /* Clamp rather than drop taps in the letterbox bars: a drag that leaves the video area
+         * keeps moving along the nearest edge instead of freezing mid-gesture, the DOWN/MOVE/UP
+         * stream stays complete (no extra suppression state), and wire coordinates never go
+         * out of range. scale > 0 is guaranteed by the size check in convert(). */
         int x = clamp(Math.round((viewX - offsetX) / scale), videoW - 1);
         int y = clamp(Math.round((viewY - offsetY) / scale), videoH - 1);
         messages.add(Protocol.serializeTouchEvent(action, pointerId, x, y, videoW, videoH, pressure));

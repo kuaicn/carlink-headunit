@@ -2,6 +2,7 @@ package com.carlink.headunit.video;
 
 import com.carlink.headunit.net.Protocol;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 
@@ -54,8 +55,10 @@ public final class PacketReader {
      * Read one video packet (blocking).
      *
      * @return the shared {@link Packet} instance
-     * @throws java.io.EOFException on a clean end of stream (phone stopped the session)
-     * @throws IOException          on I/O error or a desynchronized/corrupt stream
+     * @throws java.io.EOFException on a clean end of stream between packets (phone stopped
+     *         the session)
+     * @throws IOException          on I/O error, a truncated packet or a desynchronized/corrupt
+     *         stream
      */
     public Packet readPacket() throws IOException {
         Protocol.readFully(in, header, 0, Protocol.PACKET_HEADER_SIZE);
@@ -71,7 +74,13 @@ public final class PacketReader {
         if (packet.data == null || packet.data.length < packet.length) {
             packet.data = new byte[packet.length];
         }
-        Protocol.readFully(in, packet.data, 0, packet.length);
+        try {
+            Protocol.readFully(in, packet.data, 0, packet.length);
+        } catch (EOFException e) {
+            // The header was already consumed: a half-read payload means the connection
+            // dropped mid-packet, not a clean end of session
+            throw new IOException("Truncated packet: connection lost mid-payload (" + packet.length + " bytes)", e);
+        }
         return packet;
     }
 }
