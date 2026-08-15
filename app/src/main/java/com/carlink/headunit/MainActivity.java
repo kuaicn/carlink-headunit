@@ -64,6 +64,13 @@ public class MainActivity extends Activity {
     }
 
     private void startProjection() {
+        // The button stays disabled until the projection returns; check it here (not only via
+        // the disabled click target) because the IME action listener below fires regardless of
+        // the button state and would otherwise stack a second ProjectionActivity racing for
+        // the phone's single session slot
+        if (!btnConnect.isEnabled()) {
+            return;
+        }
         String ip = editIp.getText().toString().trim();
         if (!isValidIpv4(ip)) {
             Log.d(TAG, "invalid IP input: \"" + ip + "\"");
