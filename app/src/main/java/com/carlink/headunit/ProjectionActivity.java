@@ -53,8 +53,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>
  * Touch events are converted on the UI thread and serialized to the control socket by a
  * dedicated sender thread. The BACK key injects BACK into the phone's virtual display
- * instead of leaving (or cancels the connection attempt if no session exists yet);
- * double-tapping the top-left corner exits the projection.
+ * instead of leaving (or cancels the connection attempt if no session exists yet).
+ * Exiting is possible by touch (double-tap the top-left corner) and by keys alone
+ * (long-press BACK), so head units without a touchscreen are never trapped.
  */
 public class ProjectionActivity extends Activity implements SurfaceHolder.Callback {
 
@@ -67,6 +68,11 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
      * attempts; only transient failures qualify (see {@link #isRetriable}). */
     private static final int MAX_RETRIES = 3;
     private static final long RETRY_DELAY_MS = 2000;
+
+    /** Longer delay after a "busy" rejection: the phone frees its single session slot only
+     * once the previous session's teardown (encoder stop, virtual display release, processor
+     * joins) has fully run, which can outlast the plain retry delay. */
+    private static final long RETRY_DELAY_BUSY_MS = 3000;
 
     /** Stall hint: after a forwarded touch, no new frame within this window means the
      * network is dropping the stream (a merely static picture produces no touch first). */
@@ -100,7 +106,8 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
      * Written on the decoder thread, read on the UI thread (same packing as TouchEventConverter). */
     private volatile long videoSize;
 
-    private Thread sessionThread;
+    // Volatile: disconnect() reads it from any thread (like the other session-crew fields)
+    private volatile Thread sessionThread;
     private volatile TouchMessageSender touchSender;
     private volatile DeviceMessageReader controlReader;
     private volatile VideoDecoder videoDecoder;
@@ -110,8 +117,10 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
 
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
 
-    /** Last forwarded touch (UI thread) and last received video packet (session thread),
-     * both uptimeMillis; the stall checker compares the two. */
+    /** First forwarded touch not yet answered by a frame (UI thread) and last received video
+     * packet (session thread), both uptimeMillis; the stall checker compares the two. A frame
+     * arriving after a touch moves lastFrameTime past lastTouchTime, which re-arms the clock
+     * for the next touch (see {@link #onSurfaceTouch}). */
     private volatile long lastTouchTime;
     private volatile long lastFrameTime;
     /** True once the first frame is on screen; the stall hint is meaningless before that. */
@@ -124,12 +133,14 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
      * for a while" alone is not a problem signal and must not raise a hint. But a touch
      * always changes the picture, so if no frame follows within {@link #STALL_HINT_MS} the
      * network is almost certainly dropping the stream — say so while the picture is frozen,
-     * and hide the hint as soon as frames resume.
+     * and hide the hint as soon as frames resume. The clock is armed by the first touch not
+     * yet answered by a frame (see {@link #onSurfaceTouch}), so a continuous gesture on a
+     * stalled stream cannot postpone the hint indefinitely.
      */
     private final Runnable stallChecker = new Runnable() {
         @Override
         public void run() {
-            boolean stalled = streaming && lastTouchTime > lastFrameTime
+            boolean stalled = streaming && !disconnecting.get() && lastTouchTime > lastFrameTime
                     && SystemClock.uptimeMillis() - lastTouchTime > STALL_HINT_MS;
             if (stalled != stallHintShown) {
                 stallHintShown = stalled;
@@ -260,9 +271,10 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
     /**
      * Size the SurfaceView to the video's fit-center rect inside its parent (UI thread only).
      * MediaCodec stretches decoded frames to fill the whole surface, so aspect-correct
-     * rendering is achieved by shaping the view itself; the touch mapping recomputes the
-     * same FitCenter placement from the resulting view size, so picture and input stay
-     * aligned even if the video aspect ever differs from the screen's. Resizing a
+     * rendering is achieved by shaping the view itself; the touch mapping applies the exact
+     * per-axis inverse of that stretch from the resulting view size, so picture and input
+     * stay aligned even when the integer-rounded surface size is not exactly proportional
+     * to the video. Resizing a
      * SurfaceView only re-sizes its surface (surfaceChanged), it is never destroyed, so
      * the running decoder keeps its surface. No-op until the video size is known, and
      * guarded against re-setting identical layout params (which would re-trigger
@@ -406,7 +418,15 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
             }
             // A retried attempt needs a fresh session: a failed connect has closed the old one
             if (attempt > 1) {
-                session = new CarLinkSession();
+                CarLinkSession fresh = new CarLinkSession();
+                session = fresh;
+                if (disconnecting.get()) {
+                    // disconnect() landed between the loop-top check and the swap: it closed
+                    // the OLD instance and does not know this one, so close it here instead
+                    // of entering a blocking connect nobody can cancel anymore
+                    fresh.close();
+                    throw new IOException("cancelled");
+                }
             }
             try {
                 CarLinkSession.Ready ready = session.connect(phoneIp, controlPort, metrics.widthPixels,
@@ -419,10 +439,13 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
                 if (attempt > MAX_RETRIES || !isRetriable(e)) {
                     throw e;
                 }
-                Log.i(TAG, "connect attempt " + attempt + " failed, retrying in " + RETRY_DELAY_MS + " ms: " + e);
+                // A "busy" phone is still tearing down the previous session and frees its
+                // single slot only when done: give it a wider berth than a network hiccup
+                long delayMs = isBusy(e) ? RETRY_DELAY_BUSY_MS : RETRY_DELAY_MS;
+                Log.i(TAG, "connect attempt " + attempt + " failed, retrying in " + delayMs + " ms: " + e);
                 showStatus(getString(R.string.projection_retrying, attempt, MAX_RETRIES));
                 try {
-                    Thread.sleep(RETRY_DELAY_MS);
+                    Thread.sleep(delayMs);
                 } catch (InterruptedException interrupted) {
                     // disconnect() interrupts this thread (e.g. BACK cancels the attempt)
                     Thread.currentThread().interrupt();
@@ -443,6 +466,11 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
                 return true;
             }
         }
+        return isBusy(e);
+    }
+
+    /** True for a handshake rejected with reason "busy" (the phone still holds another session). */
+    private static boolean isBusy(Exception e) {
         String message = e.getMessage();
         return message != null && message.toLowerCase(Locale.US).contains("busy");
     }
@@ -535,10 +563,15 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
             }
             lastCornerTapTime = now;
         }
-        // Stall-check input: a touch always changes the picture, so it starts the clock
-        // after which a missing frame means the network is stalling (event time is
-        // uptimeMillis-based, the same clock the stall checker uses)
-        lastTouchTime = event.getEventTime();
+        // Stall-check input: a touch always changes the picture, so the first touch since the
+        // last received frame arms the clock after which a missing frame means the network is
+        // stalling. Touches while no frame has arrived must NOT re-arm it: on a stalled stream
+        // a continuous gesture would otherwise keep pushing the deadline out, and the hint
+        // would never show mid-gesture (event time is uptimeMillis-based, the same clock the
+        // stall checker uses)
+        if (lastTouchTime <= lastFrameTime) {
+            lastTouchTime = event.getEventTime();
+        }
         TouchMessageSender sender = touchSender;
         if (sender != null) {
             sender.sendAll(touchConverter.convert(event));
@@ -565,6 +598,19 @@ public class ProjectionActivity extends Activity implements SurfaceHolder.Callba
             // of being swallowed, so the user is never trapped on the status screen
             disconnect(null, false);
         }
+    }
+
+    @Override
+    public boolean onKeyLongPress(int keyCode, KeyEvent event) {
+        // Key-based exit for head units without a touchscreen (rotary/keypad only), which
+        // cannot perform the corner double-tap. The default Activity.onKeyDown already
+        // startTracking()s BACK, so a consumed long press also cancels the key: this press
+        // never reaches onBackPressed and no BACK is injected into the phone.
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            disconnect(null, false); // user-requested exit
+            return true;
+        }
+        return super.onKeyLongPress(keyCode, event);
     }
 
     // ------------------------------------------------------------------

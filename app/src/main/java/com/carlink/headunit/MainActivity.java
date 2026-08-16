@@ -29,7 +29,9 @@ import java.net.InetAddress;
  * <p>
  * On a phone hotspot the phone IS the WiFi gateway, so on first launch the gateway
  * address is prefilled and the connection is started automatically (once per process);
- * only when that fails (or no gateway was found) does the user type the IP by hand.
+ * only when that fails (or no gateway was found) does the user type the IP by hand. A
+ * saved address that differs from both the factory default and the current gateway is
+ * treated as a deliberate manual choice and left untouched.
  */
 public class MainActivity extends Activity {
 
@@ -89,7 +91,8 @@ public class MainActivity extends Activity {
     /**
      * One-shot auto-connect: on a phone hotspot the phone is the WiFi gateway, so prefill
      * the gateway address and connect right away. Does nothing when no gateway can be
-     * determined (no WiFi / no default route) — the manual flow stays as is.
+     * determined (no WiFi / no default route) or when the saved address is a deliberate
+     * manual choice — the manual flow stays as is.
      */
     private void tryAutoConnect() {
         if (autoConnectAttempted) {
@@ -99,6 +102,17 @@ public class MainActivity extends Activity {
         String gateway = findGatewayIp();
         if (gateway == null) {
             Log.i(TAG, "no WiFi gateway found, staying on manual input");
+            return;
+        }
+        // Respect an explicit earlier choice: a saved address that is neither the factory
+        // default nor the current gateway was typed by hand (and may well be the only one
+        // that works, e.g. the phone's service listens on another interface). Overriding it
+        // with the gateway on every cold start would force the user to cancel a doomed
+        // auto-connect each time before re-entering their address.
+        String saved = editIp.getText().toString().trim();
+        if (!saved.equals(gateway) && !saved.equals(DEFAULT_IP)) {
+            Log.i(TAG, "saved address " + saved + " differs from gateway " + gateway
+                    + ", keeping the manual choice");
             return;
         }
         Log.i(TAG, "WiFi gateway is " + gateway + ", auto-connecting");
@@ -114,17 +128,30 @@ public class MainActivity extends Activity {
     /**
      * IPv4 default-gateway address of the current WiFi connection, or null if there is
      * none (no WiFi, no default route, or only an IPv6 gateway).
+     * <p>
+     * All networks are scanned for a WiFi transport instead of only consulting
+     * getActiveNetwork(): on a head unit with Ethernet up (or with mobile data preferred)
+     * the active network is not WiFi even when the hotspot connection is fine, and a VPN
+     * network never carries the WiFi transport either. Reading the WiFi network's own
+     * routes also means the Ethernet gateway can never be picked by mistake.
      */
     @SuppressWarnings("deprecation") // WifiManager.getDhcpInfo(): fallback for the gateway
     private String findGatewayIp() {
-        // Preferred: the default route of the active network, when that network is WiFi
         ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        boolean wifiPresent = false;
         if (cm != null) {
-            Network network = cm.getActiveNetwork();
-            NetworkCapabilities caps = network != null ? cm.getNetworkCapabilities(network) : null;
-            if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                LinkProperties lp = cm.getLinkProperties(network);
-                if (lp != null) {
+            Network[] networks = cm.getAllNetworks();
+            if (networks != null) {
+                for (Network network : networks) {
+                    NetworkCapabilities caps = cm.getNetworkCapabilities(network);
+                    if (caps == null || !caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                        continue;
+                    }
+                    wifiPresent = true;
+                    LinkProperties lp = cm.getLinkProperties(network);
+                    if (lp == null) {
+                        continue;
+                    }
                     for (RouteInfo route : lp.getRoutes()) {
                         if (route.isDefaultRoute()) {
                             String ip = ipv4Address(route.getGateway());
@@ -137,14 +164,19 @@ public class MainActivity extends Activity {
             }
         }
         // Fallback: the gateway from the last successful DHCP request (deprecated since
-        // API 31 but functional from minSdk 24; the int is little-endian, 0 = none)
-        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        if (wm != null) {
-            DhcpInfo dhcp = wm.getDhcpInfo();
-            if (dhcp != null && dhcp.gateway != 0) {
-                int gw = dhcp.gateway;
-                return (gw & 0xff) + "." + ((gw >> 8) & 0xff) + "."
-                        + ((gw >> 16) & 0xff) + "." + ((gw >>> 24) & 0xff);
+        // API 31 but functional from minSdk 24; the int is little-endian, 0 = none). Only
+        // trusted while a WiFi network is actually present — with WiFi down the value can
+        // be a leftover from an earlier network and would aim the auto-connect at an
+        // address that was never the phone.
+        if (wifiPresent) {
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            if (wm != null) {
+                DhcpInfo dhcp = wm.getDhcpInfo();
+                if (dhcp != null && dhcp.gateway != 0) {
+                    int gw = dhcp.gateway;
+                    return (gw & 0xff) + "." + ((gw >> 8) & 0xff) + "."
+                            + ((gw >> 16) & 0xff) + "." + ((gw >>> 24) & 0xff);
+                }
             }
         }
         return null;

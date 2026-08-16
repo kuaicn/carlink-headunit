@@ -3,12 +3,14 @@ package com.carlink.headunit.video;
 /**
  * Fit-center (letterbox) placement of a video frame inside a container.
  * <p>
- * This is the single implementation of the scale/offset math shared by the two consumers
- * of the decoded video size, which must never disagree: the render path
- * (ProjectionActivity sizes the SurfaceView to {@link #width} x {@link #height}, since
- * MediaCodec scales decoded frames to fill the whole surface) and the touch path
- * (TouchEventConverter maps view coordinates back into video pixels through
- * {@link #scale}/{@link #offsetX}/{@link #offsetY}).
+ * Used by the render path only: ProjectionActivity sizes the SurfaceView to
+ * {@link #width} x {@link #height} (MediaCodec scales decoded frames to fill the whole
+ * surface, so aspect-correct rendering is achieved by shaping the view; the parent layout
+ * centers it at the letterbox offset). The touch path deliberately does NOT reuse this
+ * placement: view coordinates are already relative to the fitted surface, and the
+ * integer-rounded surface size is not exactly proportional to the video, so
+ * TouchEventConverter maps them back with the exact per-axis inverse of the surface
+ * stretch instead of a uniform scale/offset (which would misplace taps by ~1 video pixel).
  */
 public final class FitCenter {
 

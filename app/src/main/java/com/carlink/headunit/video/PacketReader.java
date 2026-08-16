@@ -55,13 +55,13 @@ public final class PacketReader {
      * Read one video packet (blocking).
      *
      * @return the shared {@link Packet} instance
-     * @throws java.io.EOFException on a clean end of stream between packets (phone stopped
-     *         the session)
-     * @throws IOException          on I/O error, a truncated packet or a desynchronized/corrupt
-     *         stream
+     * @throws java.io.EOFException on a clean end of stream exactly at a packet boundary
+     *         (phone stopped the session)
+     * @throws IOException          on I/O error, a truncated packet (header or payload) or a
+     *         desynchronized/corrupt stream
      */
     public Packet readPacket() throws IOException {
-        Protocol.readFully(in, header, 0, Protocol.PACKET_HEADER_SIZE);
+        readHeader();
         long ptsAndFlags = Protocol.readLongBE(header, 0);
         long length = Protocol.readIntBE(header, 8) & 0xffffffffL;
         if (length > MAX_PACKET_SIZE) {
@@ -82,5 +82,26 @@ public final class PacketReader {
             throw new IOException("Truncated packet: connection lost mid-payload (" + packet.length + " bytes)", e);
         }
         return packet;
+    }
+
+    /**
+     * Read the 12-byte packet header, telling a clean end of stream exactly at a packet
+     * boundary (EOFException — the normal phone-stopped-session case, mirrored by
+     * readCodecId's caller) apart from a connection lost with only part of the header
+     * delivered, which is a torn stream, not a clean close.
+     */
+    private void readHeader() throws IOException {
+        int total = 0;
+        while (total < Protocol.PACKET_HEADER_SIZE) {
+            int read = in.read(header, total, Protocol.PACKET_HEADER_SIZE - total);
+            if (read < 0) {
+                if (total == 0) {
+                    throw new EOFException("End of stream");
+                }
+                throw new IOException("Truncated packet: connection lost mid-header (" + total + " of "
+                        + Protocol.PACKET_HEADER_SIZE + " bytes)");
+            }
+            total += read;
+        }
     }
 }

@@ -40,6 +40,20 @@ public final class VideoDecoder {
 
     private static final long INPUT_TIMEOUT_US = 10_000; // 10 ms
 
+    /**
+     * How long {@link #feed} waits for the frame a just-queued packet produces, once
+     * streaming. Returns as soon as a frame is ready, so it costs nothing in steady state;
+     * it only matters when the decoder is momentarily behind.
+     */
+    private static final long OUTPUT_TIMEOUT_US = 10_000; // 10 ms
+
+    /**
+     * Same wait until the first frame is out: that decode includes the codec's internal
+     * bring-up and routinely takes tens of ms, and the user is staring at a black screen
+     * (plus the "waiting for video" overlay) in the meantime.
+     */
+    private static final long FIRST_OUTPUT_TIMEOUT_US = 100_000; // 100 ms
+
     private final MediaCodec codec;
     private final Listener listener;
     private final MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
@@ -75,8 +89,15 @@ public final class VideoDecoder {
     }
 
     /**
-     * Feed one packet into the decoder and drain all immediately available output frames.
+     * Feed one packet into the decoder and drain all available output frames.
      * Frames are rendered as soon as they are decoded (low latency).
+     * <p>
+     * After queueing, the first output poll waits briefly (see {@link #OUTPUT_TIMEOUT_US}):
+     * a pure {@code dequeueOutputBuffer(info, 0)} poll would almost never catch the frame
+     * this packet produces, so every decoded frame would sit in the output queue until the
+     * NEXT packet arrives — one frame of extra latency at 60fps, and on a static screen
+     * (where the phone only encodes on picture changes) the last frame of a motion, or even
+     * the very first frame of the session, would stay invisible indefinitely.
      *
      * @throws IllegalStateException (including {@link MediaCodec.CodecException}) when the
      *         hardware decoder itself fails; the caller must tear the session down
@@ -91,36 +112,48 @@ public final class VideoDecoder {
                 return;
             }
             if (inputIndex < 0) {
-                // No free input slot: drain output and retry
-                drainOutput();
+                // No free input slot: drain output and retry. No extra output wait here:
+                // dequeueInputBuffer above already waited INPUT_TIMEOUT_US.
+                drainOutput(0);
                 continue;
             }
             try {
                 ByteBuffer buffer = codec.getInputBuffer(inputIndex);
                 if (buffer == null || buffer.capacity() < length) {
-                    // Never happens with sane bitrates; drop the packet but keep the slot recycling
+                    // Never happens with sane bitrates; drop the packet but keep the slot recycling.
+                    // Dropping a keyframe corrupts the picture until the next one, so log it.
+                    Log.w(TAG, "dropping " + length + "-byte " + (isConfig ? "config" : "frame")
+                            + " packet: input buffer too small (" + (buffer == null ? "null" : buffer.capacity()) + ")");
                     codec.queueInputBuffer(inputIndex, 0, 0, 0, 0);
-                    return;
+                } else {
+                    buffer.clear();
+                    buffer.put(data, 0, length);
+                    int flags = isConfig ? MediaCodec.BUFFER_FLAG_CODEC_CONFIG : 0;
+                    codec.queueInputBuffer(inputIndex, 0, length, pts, flags);
                 }
-                buffer.clear();
-                buffer.put(data, 0, length);
-                int flags = isConfig ? MediaCodec.BUFFER_FLAG_CODEC_CONFIG : 0;
-                codec.queueInputBuffer(inputIndex, 0, length, pts, flags);
             } catch (IllegalStateException e) {
                 rethrowUnlessStopping(e);
                 return;
             }
             break;
         }
-        drainOutput();
+        // Config packets carry no picture and can never produce output: don't wait for them.
+        long outputTimeoutUs = isConfig ? 0 : firstFrameRendered ? OUTPUT_TIMEOUT_US : FIRST_OUTPUT_TIMEOUT_US;
+        drainOutput(outputTimeoutUs);
     }
 
-    private void drainOutput() {
+    /**
+     * Drain decoded frames, rendering each immediately. {@code firstTimeoutUs} applies only
+     * to the first poll (0 = pure non-blocking drain); later polls never block.
+     */
+    private void drainOutput(long firstTimeoutUs) {
         // The whole loop is guarded: getOutputFormat/releaseOutputBuffer fail with
         // IllegalStateException on a concurrent teardown just like dequeueOutputBuffer does
         try {
+            long timeoutUs = firstTimeoutUs;
             for (;;) {
-                int outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0);
+                int outputIndex = codec.dequeueOutputBuffer(bufferInfo, timeoutUs);
+                timeoutUs = 0;
                 if (outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                     return;
                 }
@@ -159,6 +192,11 @@ public final class VideoDecoder {
     }
 
     private void onFormatChanged(MediaFormat format) {
+        // getInteger() NPEs on a missing key; a broken codec must not kill the session here
+        if (!format.containsKey(MediaFormat.KEY_WIDTH) || !format.containsKey(MediaFormat.KEY_HEIGHT)) {
+            Log.w(TAG, "ignoring decoder format without width/height keys");
+            return;
+        }
         int width = format.getInteger(MediaFormat.KEY_WIDTH);
         int height = format.getInteger(MediaFormat.KEY_HEIGHT);
         // Prefer the visible crop rectangle when the codec reports one
@@ -167,7 +205,13 @@ public final class VideoDecoder {
             width = format.getInteger("crop-right") - format.getInteger("crop-left") + 1;
             height = format.getInteger("crop-bottom") - format.getInteger("crop-top") + 1;
         }
-        if (width > 0 && height > 0 && (width != videoWidth || height != videoHeight)) {
+        if (width <= 0 || height <= 0) {
+            // A broken codec format (or a degenerate crop) must not poison the touch
+            // mapping and the surface sizing with a non-positive size
+            Log.w(TAG, "ignoring decoder format with invalid size " + width + "x" + height);
+            return;
+        }
+        if (width != videoWidth || height != videoHeight) {
             videoWidth = width;
             videoHeight = height;
             Log.i(TAG, "video size changed: " + width + "x" + height);

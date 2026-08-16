@@ -36,5 +36,5 @@
     <string name="reason_decode_error">视频解码错误</string>
     <string name="reason_unmapped">未知原因（%1$s）</string>
     <string name="toast_disconnected">投屏已断开：%1$s</string>
-    <string name="exit_hint">双击左上角退出投屏</string>
+    <string name="exit_hint">双击左上角或长按返回键退出投屏</string>
 </resources>

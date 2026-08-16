@@ -16,8 +16,9 @@ import java.io.InputStream;
  * interpreted (clipboard sync is not implemented), so a misparse is harmless by construction.
  * <p>
  * An unknown type byte cannot be length-delimited, so the only safe resync strategy is to
- * discard just that byte and retry parsing at the next one; the stream then self-heals at the
- * latest on the next heartbeat (a single 0x03 byte every ~10s).
+ * discard just that byte and retry parsing at the next one; the stream then self-heals on one
+ * of the following heartbeats (a single 0x03 byte every ~10s — a false CLIPBOARD/ACK sync may
+ * skip past one, but bytes consumed while resyncing still feed the liveness timestamp).
  * <p>
  * Mirrors {@code TouchMessageSender}: a dedicated thread does the blocking reads, a failure is
  * reported once through {@link ErrorListener} (a failure surfacing after {@link #stop} is
@@ -44,7 +45,8 @@ public final class DeviceMessageReader {
     private Thread thread;
     private volatile boolean running;
 
-    /** Last control-channel byte received (uptimeMillis); 0 until the first message. */
+    /** Last control-channel byte received (uptimeMillis); 0 until the first message. Refreshed
+     * on every byte read, including skipped payload (see {@link #skipClipboard()}). */
     private volatile long lastRxTime;
     /** Sticky once a heartbeat was seen; only a heartbeat-capable (new) phone ever sends one. */
     private volatile boolean heartbeatSeen;
@@ -124,6 +126,10 @@ public final class DeviceMessageReader {
             if (count < 0) {
                 throw new EOFException("phone closed the control channel");
             }
+            // Payload bytes are signs of life too: a resync false positive can park the parser
+            // in this skip for a long time, and heartbeats swallowed as payload must still feed
+            // the phone-death detection
+            lastRxTime = SystemClock.uptimeMillis();
             remaining -= count;
         }
     }
